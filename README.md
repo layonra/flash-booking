@@ -25,38 +25,44 @@ Requisitos funcionais e não funcionais definidos no enunciado oficial do desafi
 
 ## Stack
 
-- Java 21
-- Spring Boot 3.5
-- Spring Web
-- Spring Data JPA
-- PostgreSQL
-- Flyway
-- JUnit 5
-- Mockito
-- Testcontainers
-- Docker Compose (imagem multi-stage: build Maven no container, JRE na final)
+Java 21, Spring Boot 3.5, Spring Web, Spring Data JPA, PostgreSQL, Flyway, JUnit 5, Mockito, Testcontainers, Docker Compose.
 
 ## Arquitetura
 
-A aplicação é stateless:
+A aplicação é stateless e escala horizontalmente:
 
 ```text
-                    ┌──────────────┐
-                    │    Client    │
-                    └──────┬───────┘
-                           │
-             ┌─────────────▼─────────────┐
-             │      Spring Boot API      │
-             │       stateless           │
-             └─────────────┬─────────────┘
-                           │
-             ┌─────────────▼─────────────┐
-             │        PostgreSQL         │
-             │       source of truth     │
-             └───────────────────────────┘
+                              ┌─────────────┐
+                              │   Client    │
+                              └──────┬──────┘
+                                     │ HTTP/JSON
+                ┌────────────────────┼────────────────────┐
+                │                    │                    │
+        ┌───────▼───────┐    ┌───────▼───────┐    ┌───────▼───────┐
+        │  Spring Boot  │    │  Spring Boot  │    │  Spring Boot  │
+        │  instance 1   │    │  instance 2   │    │  instance N   │
+        │               │    │               │    │               │
+        │ Controller    │    │ Controller    │    │ Controller    │
+        │ Service       │    │ Service       │    │ Service       │
+        │ Scheduler     │    │ Scheduler     │    │ Scheduler     │
+        └───────┬───────┘    └───────┬───────┘    └───────┬───────┘
+                │                    │                    │
+                └────────────────────┼────────────────────┘
+                                     │ JDBC
+                     ┌───────────────▼───────────────────┐
+                     │            PostgreSQL             │
+                     │          source of truth          │
+                     │                                   │
+                     │  transações · atomic UPDATE       │
+                     │  constraints (CHECK, PK, FK)      │
+                     │  CAS: UPDATE ... WHERE status =   │
+                     │  'PENDING'                        │
+                     └───────────────────────────────────┘
 ```
 
-Várias instâncias da API podem executar simultaneamente porque nenhuma informação crítica de concorrência fica na memória da aplicação.
+Todas as instâncias são processos idênticos, sem estado compartilhado em memória. O scheduler de expiração roda em todas ao mesmo tempo, e a corrida é resolvida dentro do banco: quem vencer o `UPDATE ... WHERE status = 'PENDING'` faz o release do estoque; as demais recebem `0` linhas e não repetem o efeito.
+
+A escalabilidade horizontal é segura porque nenhum ponto de coordenação fica na aplicação — é todo o PostgreSQL.
 
 ## 1. PostgreSQL como source of truth
 
@@ -283,13 +289,25 @@ A reserva continuaria a ser decidida pelo PostgreSQL.
 
 ## 8. Estados
 
-Os estados de reserva são:
-
 ```text
-PENDING
-CANCELLED
-EXPIRED
+                    ┌─────────────────────────────┐
+                    │      POST /reservations     │
+                    │      (débito de estoque)    │
+                    └──────────────┬──────────────┘
+                                   │
+                             ┌─────▼─────┐
+                      ┌──────┤  PENDING  ├──────┐
+                      │      └───────────┘      │
+        DELETE /reservations/{id}        scheduler
+          ┌───────────▼───────┐    ┌───────▼──────────┐
+          │    CANCELLED      │    │     EXPIRED      │
+          │ (devolve estoque) │    │ (devolve estoque)│
+          └───────────────────┘    └──────────────────┘
 ```
+
+Todas as transições de saída de `PENDING` são CAS (`UPDATE ... WHERE status = 'PENDING'`): apenas um caminho consegue sair, e quem transiciona é o único que devolve o estoque.
+
+Os estados são `PENDING`, `CANCELLED` e `EXPIRED`.
 
 Não existe `CONFIRMED` porque o desafio não define pagamento ou confirmação.
 
