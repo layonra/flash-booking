@@ -1,0 +1,60 @@
+@startuml
+title Concorrência — duas instâncias usam a mesma Idempotency-Key
+autonumber
+skinparam shadowing false
+
+actor Client
+participant "API Instance A" as A
+participant "API Instance B" as B
+database "PostgreSQL" as DB
+
+Client -> A : POST reservation\nkey=key-abc, quantity=2
+Client -> B : retry concorrente\nkey=key-abc, quantity=2
+
+par Instance A
+  A -> DB : SELECT idempotency_keys\nWHERE key_value='key-abc'
+  DB --> A : não existe
+  A -> DB : UPDATE events ...\nWHERE available_quantity >= 2
+  DB --> A : 1 row
+  A -> DB : INSERT INTO reservations (...)
+  DB --> A : insert OK
+  A -> DB : INSERT INTO idempotency_keys (... key-abc ...)
+  DB --> A : insert OK
+  A -> DB : COMMIT
+else Instance B
+  B -> DB : SELECT idempotency_keys\nWHERE key_value='key-abc'
+  DB --> B : não existe (consulta ocorreu antes do commit de A)
+  B -> DB : UPDATE events ...\nWHERE available_quantity >= 2
+  note right of B
+    B pode aguardar pelo lock da linha
+    de events; o estoque é reavaliado.
+    Isso protege o inventário, mas não
+    substitui a restrição UNIQUE da chave.
+  end note
+  DB --> B : 1 row se houver estoque suficiente
+  B -> DB : INSERT INTO reservations (...)
+  DB --> B : insert OK
+  B -> DB : INSERT INTO idempotency_keys (... key-abc ...)
+  note right of DB
+    PRIMARY KEY (key_value):
+    o INSERT duplicado espera a transação concorrente.
+    Se A fez COMMIT, o INSERT de B falha por unicidade.
+  end note
+  DB --> B : unique violation
+  B -> DB : ROLLBACK
+  note right of B
+    O rollback desfaz o decremento e a reservation
+    criados por B, pois participavam da mesma transação.
+  end note
+end
+
+A --> Client : 201 Created\nreserva criada
+B --> Client : 409 IDEMPOTENCY_CONCURRENT_REQUEST\ncliente deve retry com a mesma chave/payload
+
+note over Client,DB
+  Após o retry, B encontra a chave persistida e retorna
+  a reserva original. A implementação atual responde 409
+  no conflito concorrente; ela não resolve a reserva original
+  dentro da mesma tentativa perdedora.
+end note
+@enduml

@@ -1,0 +1,94 @@
+@startuml
+title Criar reserva — transação, SQL e retry idempotente
+autonumber
+skinparam shadowing false
+
+actor Client
+participant "ReservationController" as Controller
+participant "ReservationService" as Service
+participant "IdempotencyKeyRepository" as IdemRepo
+participant "EventRepository" as EventRepo
+participant "ReservationRepository" as ReservationRepo
+database "PostgreSQL" as DB
+
+== Primeira requisição ==
+Client -> Controller : POST /events/{eventId}/reservations
+note right of Client
+Headers:
+Idempotency-Key: key-abc
+Content-Type: application/json
+
+Payload:
+{
+  "quantity": 2
+}
+end note
+Controller -> Service : reserve(eventId, request, "key-abc")
+activate Service
+
+group @Transactional — reserve()
+  Service -> IdemRepo : findById("key-abc")
+  IdemRepo -> DB : SELECT ... FROM idempotency_keys\nWHERE key_value = 'key-abc'
+  DB --> IdemRepo : nenhuma linha
+  IdemRepo --> Service : Optional.empty
+
+  Service -> EventRepo : existsById(eventId)
+  EventRepo -> DB : SELECT EXISTS(... events ... id = :eventId)
+  DB --> EventRepo : true
+  EventRepo --> Service : true
+
+  Service -> EventRepo : reserveInventory(eventId, 2)
+  EventRepo -> DB : UPDATE events\nSET available_quantity = available_quantity - 2\nWHERE id = :eventId\n  AND available_quantity >= 2
+  DB --> EventRepo : 1 row affected
+  EventRepo --> Service : 1
+
+  Service -> ReservationRepo : save(PENDING reservation)
+  ReservationRepo -> DB : INSERT INTO reservations\n(id, event_id, quantity, status,\nexpires_at, created_at, updated_at)\nVALUES (..., :eventId, 2, 'PENDING', ...)
+  DB --> ReservationRepo : insert OK
+  ReservationRepo --> Service : Reservation
+
+  Service -> IdemRepo : insertNew(key, requestHash, reservationId, now)
+  IdemRepo -> DB : INSERT INTO idempotency_keys\n(key_value, request_hash, reservation_id, created_at)\nVALUES ('key-abc', :hash, :reservationId, :now)
+  DB --> IdemRepo : insert OK
+  IdemRepo --> Service : 1
+end
+note over Service,DB
+  COMMIT da transação:
+  estoque decrementado, reservation e idempotency key
+  são persistidos juntos.
+  Se uma RuntimeException provocar rollback, as três
+  alterações são revertidas.
+end note
+Service --> Controller : ReservationResponse
+deactivate Service
+Controller --> Client : 201 Created\n{id, eventId, quantity:2,\nstatus:"PENDING", expiresAt, ...}
+
+== Retry com mesma chave e mesmo payload ==
+Client -> Controller : POST /events/{eventId}/reservations\nIdempotency-Key: key-abc\n{"quantity":2}
+Controller -> Service : reserve(eventId, request, "key-abc")
+activate Service
+group @Transactional — reserve()
+  Service -> IdemRepo : findById("key-abc")
+  IdemRepo -> DB : SELECT ... FROM idempotency_keys\nWHERE key_value = 'key-abc'
+  DB --> IdemRepo : request_hash + reservation_id
+  IdemRepo --> Service : registro existente
+  Service -> Service : calcula SHA-256(eventId + ":" + quantity)\ne compara request_hash
+  Service -> ReservationRepo : findById(reservationId)
+  ReservationRepo -> DB : SELECT ... FROM reservations\nWHERE id = :reservationId
+  DB --> ReservationRepo : reserva original
+  ReservationRepo --> Service : Reservation
+end
+Service --> Controller : ReservationResponse original
+deactivate Service
+Controller --> Client : 201 Created\nresposta da reserva original\n(sem novo decremento)
+
+== Mesma chave, payload diferente ==
+Client -> Controller : POST ...\nIdempotency-Key: key-abc\n{"quantity":5}
+Controller -> Service : reserve(..., quantity=5, "key-abc")
+Service -> IdemRepo : findById("key-abc")
+IdemRepo -> DB : SELECT ... WHERE key_value = 'key-abc'
+DB --> IdemRepo : request_hash original
+Service -> Service : hash diferente
+Service --> Controller : ConflictException\nIDEMPOTENCY_KEY_REUSED
+Controller --> Client : 409 Conflict
+@enduml

@@ -1,0 +1,54 @@
+@startuml
+title Criar evento e consultar disponibilidade
+autonumber
+skinparam shadowing false
+
+actor Client
+participant "EventController" as Controller
+participant "EventService" as Service
+participant "EventRepository" as Repo
+database "PostgreSQL" as DB
+
+== POST /events ==
+Client -> Controller : POST /events\nContent-Type: application/json
+note right of Client
+Payload:
+{
+  "name": "Show Example",
+  "capacity": 100
+}
+end note
+Controller -> Service : create(request)
+activate Service
+group @Transactional — create()
+  note right of Service
+    Cria UUID e timestamp.
+    availableQuantity = capacity.
+  end note
+  Service -> Repo : save(event)
+  Repo -> DB : INSERT INTO events\n(id, name, capacity,\navailable_quantity, created_at)\nVALUES (..., 100, 100, ...)
+  DB --> Repo : evento persistido
+  Repo --> Service : Event
+end
+Service --> Controller : EventResponse
+deactivate Service
+Controller --> Client : 201 Created\n{id, name, capacity:100,\navailableQuantity:100, createdAt}
+
+== GET /events/{id} ==
+Client -> Controller : GET /events/{eventId}
+Controller -> Service : get(eventId)
+activate Service
+Service -> Repo : findById(eventId)
+Repo -> DB : SELECT ... FROM events\nWHERE id = :eventId
+DB --> Repo : linha do evento
+Repo --> Service : Event
+Service --> Controller : EventResponse
+deactivate Service
+Controller --> Client : 200 OK\n{..., availableQuantity: 100}
+
+note over Client,DB
+  A consulta lê o PostgreSQL diretamente na versão atual.
+  O valor retornado é informativo: a reserva ainda precisa
+  passar pelo UPDATE condicional de estoque.
+end note
+@enduml

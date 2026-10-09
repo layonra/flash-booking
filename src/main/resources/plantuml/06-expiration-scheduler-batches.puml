@@ -1,0 +1,56 @@
+@startuml
+title Scheduler — seleção de até 100 candidatas e expiração individual
+autonumber
+skinparam shadowing false
+
+participant "ReservationExpirationService\n(instância A)" as SchedulerA
+participant "ReservationExpirationService\n(instância B)" as SchedulerB
+participant "ReservationRepository" as Repo
+participant "ReservationService" as Service
+database "PostgreSQL" as DB
+
+par Scheduler A
+  SchedulerA -> Repo : findTop100ByStatusAndExpiresAtLessThanEqualOrderByExpiresAtAsc(PENDING, now)
+  Repo -> DB : SELECT ... FROM reservations\nWHERE status='PENDING'\n  AND expires_at <= :now\nORDER BY expires_at ASC\nLIMIT 100
+  DB --> Repo : até 100 candidatas
+  Repo --> SchedulerA : lista de candidatas
+else Scheduler B
+  SchedulerB -> Repo : mesma consulta
+  Repo -> DB : SELECT ... WHERE status='PENDING'\nAND expires_at <= :now\nORDER BY expires_at ASC LIMIT 100
+  DB --> Repo : candidatas (podem se sobrepor)
+  Repo --> SchedulerB : lista de candidatas
+end
+
+loop Para cada candidata da lista
+  SchedulerA -> Service : expire(reservationId, now)
+  activate Service
+  group @Transactional — expire()
+    Service -> Repo : findById(id)
+    Repo -> DB : SELECT * FROM reservations WHERE id=:id
+    DB --> Repo : reserva
+    Service -> Repo : transitionStatus(id, PENDING, EXPIRED, now)
+    Repo -> DB : UPDATE reservations\nSET status='EXPIRED', updated_at=:now\nWHERE id=:id AND status='PENDING'
+    DB --> Repo : 1 ou 0 rows
+    alt 1 row affected
+      Service -> DB : UPDATE events\nSET available_quantity = available_quantity + :quantity\nWHERE id=:eventId\nAND available_quantity + :quantity <= capacity
+      DB --> Service : 1 row affected
+      note right of Service
+        COMMIT: status e estoque são confirmados juntos.
+      end note
+    else 0 rows affected
+      note right of Service
+        A reserva já não está PENDING.
+        Não liberar estoque.
+      end note
+    end
+  end
+  deactivate Service
+end
+
+note over SchedulerA,DB
+  O scheduler busca até 100 candidatas por execução.
+  A seleção não bloqueia nem "reivindica" os registros;
+  a transição condicional é a proteção concorrente.
+  Cada chamada a expire() é transacional separadamente.
+end note
+@enduml

@@ -1,0 +1,51 @@
+@startuml
+title Flash Booking — Arquitetura de componentes
+left to right direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+
+actor Client
+component "Load Balancer\n(opcional)" as LB
+package "Spring Boot — instâncias stateless" {
+  component "EventController" as EC
+  component "ReservationController" as RC
+  component "ReservationQueryController" as RQC
+  component "EventService" as ES
+  component "ReservationService" as RS
+  component "ReservationExpirationService\n@Scheduled" as Scheduler
+  component "Spring Data Repositories" as Repos
+}
+database "PostgreSQL\nsource of truth" as DB
+
+Client --> LB : HTTP/JSON
+LB --> EC
+LB --> RC
+LB --> RQC
+EC --> ES
+RC --> RS
+RQC --> RS
+ES --> Repos
+RS --> Repos
+Scheduler --> RS : expire(id, now)\npor candidata
+Scheduler --> Repos : busca até 100 candidatas
+Repos --> DB : SQL/JPQL executado no banco
+
+note bottom of RS
+  @Transactional:
+  - reserve()
+  - cancel()
+  - expire()
+
+  O banco coordena alterações concorrentes.
+  A aplicação não guarda estoque/chaves em memória.
+end note
+
+note bottom of DB
+  events:
+    estoque + constraints CHECK
+  reservations:
+    estado + índice de expiração
+  idempotency_keys:
+    chave PRIMARY KEY + request_hash
+end note
+@enduml

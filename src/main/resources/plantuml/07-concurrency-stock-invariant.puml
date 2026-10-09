@@ -1,0 +1,36 @@
+@startuml
+title Estoque — duas reservas concorrentes e UPDATE condicional
+autonumber
+skinparam shadowing false
+
+participant "Request A" as A
+participant "Request B" as B
+database "PostgreSQL" as DB
+
+note over DB
+Estoque inicial: 10
+A quer 7; B quer 5
+end note
+
+par Request A chega primeiro
+  A -> DB : UPDATE events\nSET available_quantity = available_quantity - 7\nWHERE id=:eventId AND available_quantity >= 7
+  DB --> A : 1 row affected; estoque passa a 3\n(linha fica bloqueada até a transação terminar)
+  A -> DB : COMMIT
+else Request B tenta simultaneamente
+  B -> DB : UPDATE events\nSET available_quantity = available_quantity - 5\nWHERE id=:eventId AND available_quantity >= 5
+  note right of B
+    Se A ainda não concluiu, B aguarda
+    a disputa pela mesma linha.
+  end note
+  DB --> B : após A confirmar, condição reavaliada:\n3 >= 5 é falso; 0 rows affected
+end
+
+note over A,DB
+Resultado se A vencer:
+A tem sucesso; B não reserva;
+estoque final = 3.
+Se B vencer, B tem sucesso, A falha
+e estoque final = 5.
+A ordem não é determinística.
+end note
+@enduml

@@ -1,0 +1,47 @@
+@startuml
+title Cancelamento vs expiração — transição condicional e liberação única
+autonumber
+skinparam shadowing false
+
+participant "Client" as Client
+participant "ReservationService.cancel()" as Cancel
+participant "ReservationService.expire()" as Expire
+database "PostgreSQL" as DB
+
+note over DB
+Estado inicial:
+reservations.status = 'PENDING'
+events.available_quantity = 8
+reservation.quantity = 2
+end note
+
+par Cancelamento vence
+  Client -> Cancel : DELETE /reservations/{id}
+  activate Cancel
+  group @Transactional — cancel()
+    Cancel -> DB : SELECT * FROM reservations WHERE id=:id
+    DB --> Cancel : event_id, quantity=2, status=PENDING
+    Cancel -> DB : UPDATE reservations\nSET status='CANCELLED', updated_at=:now\nWHERE id=:id AND status='PENDING'
+    DB --> Cancel : 1 row affected
+    Cancel -> DB : UPDATE events\nSET available_quantity = available_quantity + 2\nWHERE id=:eventId\n  AND available_quantity + 2 <= capacity
+    DB --> Cancel : 1 row affected
+  end
+  Cancel --> Client : 204 No Content
+  deactivate Cancel
+else Scheduler tenta expirar
+  Expire -> DB : UPDATE reservations\nSET status='EXPIRED', updated_at=:now\nWHERE id=:id AND status='PENDING'
+  DB --> Expire : 0 rows affected após a transição confirmada
+  note right of Expire
+    Não libera estoque porque não ganhou
+    a transição PENDING -> EXPIRED.
+  end note
+end
+
+== Se a transação vencedora falhar antes do COMMIT ==
+note over Cancel,DB
+  O status e a liberação do estoque estão na mesma transação.
+  Se a liberação falhar e a exceção provocar rollback,
+  a mudança para CANCELLED/EXPIRED também é revertida.
+  Outro processo pode tentar novamente.
+end note
+@enduml
